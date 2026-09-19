@@ -1,510 +1,193 @@
-import asyncio
+import os
 import time
-import re
-from collections import deque
-from typing import Dict, Any
-
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-
+import asyncio
+import threading
+import requests
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 from TikTokLive import TikTokLiveClient
-from TikTokLive.events import (
-    ConnectEvent,
-    DisconnectEvent,
-    CommentEvent,
-    GiftEvent,
-    LikeEvent,
-    FollowEvent,
-    ShareEvent,
-    JoinEvent,
-)
+from TikTokLive.events import CommentEvent, GiftEvent, LikeEvent, MemberEvent
 
-app = FastAPI(title="SEEYOUTIK LIVE Comments")
+app = Flask(__name__)
+CORS(app)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+EULER_API_KEY = os.environ.get("EULER_API_KEY", "euler_TON_API_KEY_ICI")
 
-MAX_COMMENTS = 100
-MAX_USERS = 3
+clients = {}
+chat_store = {}
+stream_store = {}
 
-USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,40}$")
-
-rooms: Dict[str, Dict[str, Any]] = {}
-rooms_lock = asyncio.Lock()
-
-
-def clean_username(username: str) -> str:
-    username = username.strip()
-
-    if username.startswith("@"):
-        username = username[1:]
-
-    return username.lower()
-
-
-def valid_username(username: str) -> bool:
-    return bool(USERNAME_RE.fullmatch(username))
-
-
-def make_event(event_type: str, **data):
-    return {
-        "type": event_type,
-        "timestamp": time.time(),
-        **data,
-    }
-
-
-async def add_event(username: str, event: dict):
-    room = rooms.get(username)
-
-    if room:
-        room["events"].append(event)
-
-
-def create_client(username: str):
-
-    client = TikTokLiveClient(
-        unique_id=username
-    )
-
-    @client.on(ConnectEvent)
-    async def on_connect(event: ConnectEvent):
-
-        print(f"[CONNECTED] @{username}")
-
-        room = rooms.get(username)
-
-        if room:
-            room["connected"] = True
-            room["error"] = None
-
-            await add_event(
-                username,
-                make_event(
-                    "system",
-                    message=f"Connected to @{username}"
-                )
-            )
-
-    @client.on(DisconnectEvent)
-    async def on_disconnect(event: DisconnectEvent):
-
-        print(f"[DISCONNECTED] @{username}")
-
-        room = rooms.get(username)
-
-        if room:
-            room["connected"] = False
-
-            await add_event(
-                username,
-                make_event(
-                    "system",
-                    message="TikTok LIVE connection closed"
-                )
-            )
-
-    @client.on(CommentEvent)
-    async def on_comment(event: CommentEvent):
-
-        try:
-            nickname = event.user.nickname or "Unknown"
-        except Exception:
-            nickname = "Unknown"
-
-        try:
-            comment = event.comment or ""
-        except Exception:
-            comment = ""
-
-        if not comment:
-            return
-
-        print(
-            f"[COMMENT] @{username} | "
-            f"{nickname}: {comment}"
+def get_stream_from_euler(room_id):
+    if not EULER_API_KEY or "TON_API_KEY" in EULER_API_KEY:
+        print("EULER_API_KEY not configured")
+        return None
+    try:
+        r = requests.get(
+            f"https://api.eulerstream.com/webcast/room/info/?room_id={room_id}",
+            headers={"x-api-key": EULER_API_KEY},
+            timeout=15
         )
+        print("Euler HTTP:", r.status_code)
+        if r.status_code != 200:
+            print("Euler body:", r.text[:300])
+            return None
+        data = r.json()
+        su = (data.get("data") or {}).get("stream_url") or data.get("stream_url")
+        if not su:
+            print("No stream_url in Euler response")
+            return None
+        flv = su.get("flv_pull_data") or su.get("FLV_pull_data")
+        hls = su.get("hls_pull_data") or su.get("HLS_pull_data")
+        for raw in (flv, hls):
+            if raw:
+                for p in raw.split(":"):
+                    if p.startswith("http"):
+                        return p
+        return None
+    except Exception as e:
+        print("Euler error:", e)
+        return None
 
-        await add_event(
-            username,
-            make_event(
-                "comment",
-                user=nickname,
-                comment=comment
-            )
-        )
+@app.route("/start")
+def start():
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"ok": False, "error": "username required"}), 400
 
-    @client.on(GiftEvent)
-    async def on_gift(event: GiftEvent):
+    chat_store.setdefault(username, [])
 
-        try:
-            if event.gift.streakable and event.streaking:
-                return
-        except Exception:
-            pass
-
-        try:
-            user = event.user.nickname or "Unknown"
-        except Exception:
-            user = "Unknown"
-
-        try:
-            gift_name = event.gift.name or "Gift"
-        except Exception:
-            gift_name = "Gift"
-
-        try:
-            count = event.repeat_count
-        except Exception:
-            count = 1
-
-        print(
-            f"[GIFT] @{username} | "
-            f"{user} sent {gift_name} x{count}"
-        )
-
-        await add_event(
-            username,
-            make_event(
-                "gift",
-                user=user,
-                gift=gift_name,
-                count=count
-            )
-        )
-
-    @client.on(LikeEvent)
-    async def on_like(event: LikeEvent):
-
-        try:
-            user = event.user.nickname or "Unknown"
-        except Exception:
-            user = "Unknown"
-
-        try:
-            count = event.count
-        except Exception:
-            count = 1
-
-        await add_event(
-            username,
-            make_event(
-                "like",
-                user=user,
-                count=count
-            )
-        )
-
-    @client.on(FollowEvent)
-    async def on_follow(event: FollowEvent):
-
-        try:
-            user = event.user.nickname or "Unknown"
-        except Exception:
-            user = "Unknown"
-
-        print(
-            f"[FOLLOW] @{username} | {user}"
-        )
-
-        await add_event(
-            username,
-            make_event(
-                "follow",
-                user=user
-            )
-        )
-
-    @client.on(ShareEvent)
-    async def on_share(event: ShareEvent):
-
-        try:
-            user = event.user.nickname or "Unknown"
-        except Exception:
-            user = "Unknown"
-
-        await add_event(
-            username,
-            make_event(
-                "share",
-                user=user
-            )
-        )
-
-    @client.on(JoinEvent)
-    async def on_join(event: JoinEvent):
-
-        try:
-            user = event.user.nickname or "Unknown"
-        except Exception:
-            user = "Unknown"
-
-        await add_event(
-            username,
-            make_event(
-                "join",
-                user=user
-            )
-        )
-
-    return client
-
-
-async def run_client(username: str):
-
-    client = create_client(username)
-
-    room = rooms.get(username)
-
-    if room:
-        room["client"] = client
+    if username in clients and username in stream_store:
+        return jsonify({
+            "ok": True,
+            "status": "already",
+            "roomId": clients[username].room_id,
+            "stream": stream_store[username]
+        })
 
     try:
+        client = TikTokLiveClient(unique_id=f"@{username}")
 
-        print(
-            f"[STARTING] TikTok LIVE @{username}"
-        )
+        @client.on(CommentEvent)
+        async def on_comment(event):
+            user = getattr(event.user, "nickname", None) or getattr(event.user, "unique_id", "User")
+            text = getattr(event, "comment", "")
+            if not text:
+                return
+            chat_store.setdefault(username, [])
+            chat_store[username].append({
+                "type": "comment", "user": user, "comment": text,
+                "timestamp": int(time.time() * 1000)
+            })
+            if len(chat_store[username]) > 200:
+                chat_store[username] = chat_store[username][-200:]
+            print("CHAT:", user, ":", text)
 
-        await client.connect(
-            fetch_room_info=True
-        )
+        @client.on(GiftEvent)
+        async def on_gift(event):
+            user = getattr(event.user, "nickname", None) or getattr(event.user, "unique_id", "User")
+            gname = "Gift"
+            if hasattr(event, "gift") and event.gift:
+                gname = getattr(event.gift, "name", "Gift")
+            chat_store.setdefault(username, [])
+            chat_store[username].append({
+                "type": "gift", "user": user, "gift": gname,
+                "count": getattr(event, "repeat_count", 1) or 1,
+                "timestamp": int(time.time() * 1000)
+            })
+            print("GIFT:", user, gname)
 
-    except Exception as error:
+        @client.on(LikeEvent)
+        async def on_like(event):
+            user = getattr(event.user, "nickname", None) or getattr(event.user, "unique_id", "User")
+            chat_store.setdefault(username, [])
+            chat_store[username].append({
+                "type": "like", "user": user,
+                "count": getattr(event, "count", 1) or 1,
+                "timestamp": int(time.time() * 1000)
+            })
 
-        print(
-            f"[ERROR] @{username}: {error}"
-        )
+        @client.on(MemberEvent)
+        async def on_member(event):
+            user = getattr(event.user, "nickname", None) or getattr(event.user, "unique_id", "User")
+            chat_store.setdefault(username, [])
+            chat_store[username].append({
+                "type": "join", "user": user,
+                "timestamp": int(time.time() * 1000)
+            })
 
-        room = rooms.get(username)
-
-        if room:
-
-            room["connected"] = False
-            room["error"] = str(error)
-
-            await add_event(
-                username,
-                make_event(
-                    "error",
-                    message=str(error)
-                )
-            )
-
-    finally:
-
-        room = rooms.get(username)
-
-        if room:
-            room["connected"] = False
-
-            if room.get("client") is client:
-                room["client"] = None
-
-        print(
-            f"[STOPPED] @{username}"
-        )
-
-
-@app.get("/")
-async def root():
-
-    return {
-        "service": "SEEYOUTIK LIVE Comments",
-        "status": "online"
-    }
-
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "ok",
-        "rooms": len(rooms)
-    }
-
-
-@app.get("/start")
-async def start(
-    username: str = Query(...)
-):
-
-    username = clean_username(username)
-
-    if not valid_username(username):
-
-        return {
-            "ok": False,
-            "error": "Invalid TikTok username"
-        }
-
-    async with rooms_lock:
-
-        existing = rooms.get(username)
-
-        if existing:
-
-            return {
-                "ok": True,
-                "status": (
-                    "connected"
-                    if existing["connected"]
-                    else "connecting"
-                ),
-                "username": username
-            }
-
-        if len(rooms) >= MAX_USERS:
-
-            return {
-                "ok": False,
-                "error": "Maximum active users reached"
-            }
-
-        rooms[username] = {
-            "username": username,
-            "connected": False,
-            "client": None,
-            "task": None,
-            "error": None,
-            "events": deque(maxlen=MAX_COMMENTS),
-            "created": time.time()
-        }
-
-        task = asyncio.create_task(
-            run_client(username)
-        )
-
-        rooms[username]["task"] = task
-
-    return {
-        "ok": True,
-        "status": "connecting",
-        "username": username
-    }
-
-
-@app.get("/comments")
-async def comments(
-    username: str = Query(...),
-    since: float = Query(0)
-):
-
-    username = clean_username(username)
-
-    if not valid_username(username):
-
-        return {
-            "ok": False,
-            "error": "Invalid TikTok username",
-            "events": []
-        }
-
-    room = rooms.get(username)
-
-    if not room:
-
-        return {
-            "ok": False,
-            "status": "not_started",
-            "events": []
-        }
-
-    events = []
-
-    for event in room["events"]:
-
-        if event["timestamp"] > since:
-            events.append(event)
-
-    return {
-        "ok": True,
-        "username": username,
-        "connected": room["connected"],
-        "error": room["error"],
-        "events": events,
-        "server_time": time.time()
-    }
-
-
-@app.get("/status")
-async def status(
-    username: str = Query(...)
-):
-
-    username = clean_username(username)
-
-    room = rooms.get(username)
-
-    if not room:
-
-        return {
-            "ok": True,
-            "username": username,
-            "status": "not_started",
-            "connected": False
-        }
-
-    return {
-        "ok": True,
-        "username": username,
-        "status": (
-            "connected"
-            if room["connected"]
-            else "connecting"
-        ),
-        "connected": room["connected"],
-        "error": room["error"]
-    }
-
-
-@app.get("/stop")
-async def stop(
-    username: str = Query(...)
-):
-
-    username = clean_username(username)
-
-    async with rooms_lock:
-
-        room = rooms.get(username)
-
-        if not room:
-
-            return {
-                "ok": True,
-                "status": "not_started"
-            }
-
-        client = room.get("client")
-
-        if client:
-
+        def run_client():
             try:
-                await client.disconnect()
-            except Exception:
-                pass
+                asyncio.run(client.connect())
+            except Exception as e:
+                print("Client error:", e)
 
-        task = room.get("task")
+        threading.Thread(target=run_client, daemon=True).start()
 
-        if task:
+        for _ in range(60):
+            if client.room_id:
+                break
+            time.sleep(0.25)
 
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=5
-                )
-            except Exception:
-                pass
+        room_id = client.room_id
+        print("Room ID:", room_id)
 
-        rooms.pop(username, None)
+        stream_url = None
+        if room_id:
+            stream_url = get_stream_from_euler(room_id)
+            if stream_url:
+                stream_store[username] = stream_url
+                print("STREAM:", stream_url[:100])
 
-    return {
-        "ok": True,
-        "status": "stopped",
-        "username": username
-    }
+        clients[username] = client
+
+        return jsonify({
+            "ok": True, "status": "listening",
+            "roomId": room_id, "stream": stream_url
+        })
+
+    except Exception as e:
+        print("start error:", e)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/comments")
+def comments():
+    username = request.args.get("username")
+    since = int(request.args.get("since", 0))
+    if not username:
+        return jsonify({"ok": False}), 400
+    events = [e for e in chat_store.get(username, []) if e["timestamp"] > since]
+    return jsonify({"ok": True, "events": events})
+
+@app.route("/proxy")
+def proxy():
+    url = request.args.get("url")
+    if not url:
+        return "url required", 400
+    try:
+        r = requests.get(url, stream=True, timeout=30, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.tiktok.com/",
+            "Origin": "https://www.tiktok.com"
+        })
+        def generate():
+            for chunk in r.iter_content(chunk_size=16384):
+                if chunk:
+                    yield chunk
+        return Response(
+            generate(),
+            content_type=r.headers.get("content-type", "video/x-flv"),
+            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"}
+        )
+    except Exception as e:
+        print("Proxy error:", e)
+        return f"proxy error: {e}", 500
+
+@app.route("/")
+def index():
+    return jsonify({"ok": True, "service": "SEEYOUTIK", "active": len(clients)})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port)
