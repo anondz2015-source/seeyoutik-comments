@@ -14,6 +14,7 @@ CORS(app)
 clients = {}
 chat_store = {}
 
+
 @app.route("/start")
 def start():
     username = request.args.get("username")
@@ -36,7 +37,9 @@ def start():
                 return
             chat_store.setdefault(username, [])
             chat_store[username].append({
-                "type": "comment", "user": user, "comment": text,
+                "type": "comment",
+                "user": user,
+                "comment": text,
                 "timestamp": int(time.time() * 1000)
             })
             if len(chat_store[username]) > 200:
@@ -51,27 +54,22 @@ def start():
                 gname = getattr(event.gift, "name", "Gift")
             chat_store.setdefault(username, [])
             chat_store[username].append({
-                "type": "gift", "user": user, "gift": gname,
+                "type": "gift",
+                "user": user,
+                "gift": gname,
                 "count": getattr(event, "repeat_count", 1) or 1,
                 "timestamp": int(time.time() * 1000)
             })
+            print("GIFT:", user, gname)
 
         @client.on(LikeEvent)
         async def on_like(event):
             user = getattr(event.user, "nickname", None) or getattr(event.user, "unique_id", "User")
             chat_store.setdefault(username, [])
             chat_store[username].append({
-                "type": "like", "user": user,
+                "type": "like",
+                "user": user,
                 "count": getattr(event, "count", 1) or 1,
-                "timestamp": int(time.time() * 1000)
-            })
-
-        @client.on(MemberEvent)
-        async def on_member(event):
-            user = getattr(event.user, "nickname", None) or getattr(event.user, "unique_id", "User")
-            chat_store.setdefault(username, [])
-            chat_store[username].append({
-                "type": "join", "user": user,
                 "timestamp": int(time.time() * 1000)
             })
 
@@ -89,7 +87,10 @@ def start():
 
     except Exception as e:
         print("error:", e)
+        import traceback
+        traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/comments")
 def comments():
@@ -99,6 +100,7 @@ def comments():
         return jsonify({"ok": False}), 400
     events = [e for e in chat_store.get(username, []) if e["timestamp"] > since]
     return jsonify({"ok": True, "events": events})
+
 
 @app.route("/proxy")
 def proxy():
@@ -111,23 +113,34 @@ def proxy():
             "Referer": "https://www.tiktok.com/",
             "Origin": "https://www.tiktok.com"
         })
+
         def generate():
             for chunk in r.iter_content(chunk_size=16384):
                 if chunk:
                     yield chunk
-        return Response(generate(),
+
+        return Response(
+            generate(),
             content_type=r.headers.get("content-type", "video/x-flv"),
-            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"})
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache"
+            }
+        )
     except Exception as e:
+        print("Proxy error:", e)
         return f"proxy error: {e}", 500
+
 
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
 
+
 @app.route("/")
 def index():
     return jsonify({"ok": True, "service": "SEEYOUTIK", "active": len(clients)})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
