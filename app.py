@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import requests
 from TikTokLive import TikTokLiveClient
-from TikTokLive.events import CommentEvent, GiftEvent, LikeEvent, MemberEvent
+from TikTokLive.events import CommentEvent, GiftEvent, LikeEvent
 
 app = Flask(__name__)
 CORS(app)
